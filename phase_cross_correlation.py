@@ -6,6 +6,7 @@ from typing import Optional, Union
 import torch
 from numpy import fix
 from torch.fft import fftfreq, fftn, ifftn
+import torch.nn.functional as F
 
 
 def _compute_phasediff(cross_correlation_max: torch.Tensor) -> torch.Tensor:
@@ -137,10 +138,10 @@ def _upsampled_dft(
 
 
 def _disambiguate_shift(
-    reference_image: torch.Tensor, moving_image: torch.Tensor, shift: torch.Tensor
+        reference_image: torch.Tensor, moving_image: torch.Tensor, shift: torch.Tensor
 ) -> torch.Tensor:
     """
-    Determine the correct real-space shift based on periodic shifts.
+    Determine the correct real-space shift based on periodic shifts, using subpixel interpolation when needed.
 
     Parameters
     ----------
@@ -165,13 +166,21 @@ def _disambiguate_shift(
     negative_shift = [shift_i - s for shift_i, s in zip(positive_shift, shape)]
 
     # Determine if subpixel interpolation is needed (when shift contains decimals)
-    # subpixel = any(shift_i % 1 != 0 for shift_i in shift)
-    # interp_order = 3 if subpixel else 0  # Cubic interpolation (order=3) if subpixel
+    subpixel = any(shift_i % 1 != 0 for shift_i in shift)
+    # Cubic interpolation if subpixel, else nearest neighbor
+    # interp_order = 'bicubic' if subpixel else 'nearest'
 
-    # Apply the shift to the moving image using grid-wrap mode (similar to torch.roll)
-    shifted = torch.roll(
-        moving_image, shifts=[int(s) for s in shift], dims=list(range(len(shift)))
-    )
+    # Apply the shift to the moving image using grid-wrap mode (subpixel or integer shift)
+    if subpixel:
+        # Use grid_sample for subpixel interpolation
+        moving_image = _apply_subpixel_shift(moving_image,
+                                            torch.tensor(positive_shift, device=device),
+                                            mode='bicubic')
+    else:
+        # Use integer shifting
+        moving_image = torch.roll(
+            moving_image, shifts=[int(s) for s in shift], dims=list(range(len(shift)))
+        )
 
     # Get the rounded indices for slicing
     indices = torch.round(torch.tensor(positive_shift, device=device)).int()
@@ -184,11 +193,10 @@ def _disambiguate_shift(
     for test_slice in itertools.product(*splits_per_dim):
         # Reshape the slices for cross-correlation
         reference_tile = reference_image[test_slice].flatten()
-        moving_tile = shifted[test_slice].flatten()
+        moving_tile = moving_image[test_slice].flatten()
 
         if reference_tile.numel() > 2:
-            # Compute correlation (avoid division by zero errors using
-            # `torch.nan_to_num`)
+            # Compute correlation (avoid division by zero errors using torch.nan_to_num)
             reference_mean = torch.mean(reference_tile)
             moving_mean = torch.mean(moving_tile)
             reference_std = torch.std(reference_tile)
@@ -224,6 +232,51 @@ def _disambiguate_shift(
         real_shift_acc.append(pos_shift if sl.stop is None else neg_shift)
 
     return torch.tensor(real_shift_acc, dtype=dtype, device=device)
+
+
+def _apply_subpixel_shift(image: torch.Tensor, shift: torch.Tensor,
+                         mode='bicubic') -> torch.Tensor:
+    """
+    Applies a subpixel shift to the input image using grid_sample for interpolation.
+
+    Parameters:
+    -----------
+    image : torch.Tensor
+        Input image tensor of shape (C, H, W) or (B, C, H, W) for batches.
+    shift : torch.Tensor
+        Tensor with the shift amount for each axis (dx, dy).
+    mode : str
+        Interpolation mode, can be 'bilinear' or 'bicubic' for subpixel interpolation.
+
+    Returns:
+    --------
+    shifted_image : torch.Tensor
+        The shifted image tensor with subpixel interpolation.
+    """
+    # Ensure the image is in the correct shape (batch_size, channels, height, width)
+    if image.dim() == 3:
+        image = image.unsqueeze(0)  # Add batch dimension if missing (for single image)
+
+    B, C, H, W = image.shape
+
+    # Create a mesh grid for the image
+    grid_y, grid_x = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=image.device),
+        torch.linspace(-1, 1, W, device=image.device)
+    )
+    grid = torch.stack((grid_x, grid_y), dim=-1)  # Shape (H, W, 2)
+    grid = grid.unsqueeze(0).repeat(B, 1, 1, 1)  # Shape (B, H, W, 2)
+
+    # Add the normalized shift to the grid
+    shift_normalized = shift / torch.tensor([W / 2, H / 2],
+                                            device=image.device)  # Normalize shift to [-1, 1]
+    grid = grid + shift_normalized.view(1, 1, 1, 2)
+
+    # Apply grid_sample for subpixel interpolation
+    shifted_image = F.grid_sample(image, grid, mode=mode, padding_mode='zeros',
+                                  align_corners=True)
+
+    return shifted_image.squeeze(0)  # Remove batch dimension if it was added
 
 
 def _masked_phase_cross_correlation(
